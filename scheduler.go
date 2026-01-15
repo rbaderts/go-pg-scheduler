@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/tzahifadida/pgln"
 	"log/slog"
 	"reflect"
 	"runtime/debug"
@@ -14,8 +13,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/tzahifadida/pgln"
+
 	"github.com/google/uuid"
-	"github.com/jmoiron/sqlx"
 	"github.com/jonboulle/clockwork"
 	"github.com/robfig/cron/v3"
 )
@@ -133,8 +135,10 @@ type JobRecord struct {
 
 // SchedulerConfig represents the configuration for the Scheduler
 type SchedulerConfig struct {
-	Ctx                                  context.Context
-	DB                                   *sql.DB
+	Ctx context.Context
+	//	DB                                   *sql.DB
+
+	DB                                   *pgxpool.Pool
 	DBDriverName                         string
 	MaxRunningJobs                       int
 	JobCheckInterval                     time.Duration
@@ -156,10 +160,11 @@ type SchedulerConfig struct {
 }
 
 type Scheduler struct {
-	initialized          bool
-	started              bool
-	config               SchedulerConfig
-	db                   *sqlx.DB
+	initialized bool
+	started     bool
+	config      SchedulerConfig
+	//	db                   *sqlx.DB
+	db                   *pgxpool.Pool
 	nodeID               uuid.UUID
 	shutdownChan         chan struct{}
 	wg                   sync.WaitGroup
@@ -224,7 +229,7 @@ func NewScheduler(config SchedulerConfig) (*Scheduler, error) {
 		config.MaxRunningJobs = 10
 	}
 
-	sqlxDB := sqlx.NewDb(config.DB, config.DBDriverName)
+	//sqlxDB := sqlx.NewDb(config.DB, config.DBDriverName)
 
 	if config.Logger == nil {
 		config.Logger = slog.Default()
@@ -284,7 +289,7 @@ func NewScheduler(config SchedulerConfig) (*Scheduler, error) {
 
 	s := &Scheduler{
 		config:               config,
-		db:                   sqlxDB,
+		db:                   config.DB,
 		nodeID:               nodeID,
 		shutdownChan:         make(chan struct{}),
 		ctx:                  ctx,
@@ -364,7 +369,7 @@ func (s *Scheduler) Init() error {
 
 func (s *Scheduler) createSchemaIfMissing() error {
 	createSchema := fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS "%s";`, s.config.Schema)
-	_, err := s.config.DB.Exec(createSchema)
+	_, err := s.config.DB.Exec(s.ctx, createSchema)
 	if err != nil {
 		return fmt.Errorf("failed to create schema: %w", err)
 	}
@@ -396,7 +401,7 @@ func (s *Scheduler) createSchemaIfMissing() error {
     `, s.tableName, StatusPending, tableNameNoQuotes, s.tableName, tableNameNoQuotes, s.tableName,
 		tableNameNoQuotes, s.tableName, tableNameNoQuotes, s.tableName)
 
-	_, err = s.config.DB.Exec(createTable)
+	_, err = s.config.DB.Exec(s.ctx, createTable)
 	if err != nil {
 		return fmt.Errorf("failed to create schema: %w", err)
 	}
@@ -426,13 +431,25 @@ func (s *Scheduler) RegisterJob(job Job) error {
 
 func (s *Scheduler) GetJob(name, key string) (*JobRecord, error) {
 	query := fmt.Sprintf(`SELECT * FROM %s WHERE "name" = $1 AND "key" = $2`, s.tableName)
+
 	var job JobRecord
-	err := s.db.Get(&job, query, name, key)
-	if err == sql.ErrNoRows {
-		return nil, ErrJobNotFound
-	}
+
+	rows, err := s.db.Query(s.ctx, query, name, key)
 	if err != nil {
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	recs, err := pgx.CollectRows(rows, pgx.RowToStructByName[JobRecord])
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrJobNotFound
+		}
 		return nil, fmt.Errorf("failed to get job: %w", err)
+	}
+	if len(recs) > 1 {
+		return nil, fmt.Errorf("more than one job record for key")
 	}
 	return &job, nil
 }
@@ -518,11 +535,11 @@ func (s *Scheduler) ScheduleJob(job Job) error {
 	}
 
 	// Start transaction
-	tx, err := s.db.BeginTx(s.ctx, nil)
+	tx, err := s.db.Begin(s.ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(s.ctx)
 
 	var nextRun time.Time
 	calculator := job.NextRunCalculator()
@@ -559,7 +576,7 @@ func (s *Scheduler) ScheduleJob(job Job) error {
 		s.tableName, s.tableName, s.tableName, s.tableName, s.tableName)
 
 	var returnedName string
-	err = tx.QueryRow(query,
+	err = tx.QueryRow(s.ctx, query,
 		job.Name(),
 		job.Key(),
 		uuid.Nil,
@@ -582,13 +599,13 @@ func (s *Scheduler) ScheduleJob(job Job) error {
 	}
 
 	if notifyQuery != nil {
-		_, err = tx.ExecContext(s.ctx, notifyQuery.Query, notifyQuery.Params...)
+		_, err = tx.Exec(s.ctx, notifyQuery.Query, notifyQuery.Params...)
 		if err != nil {
 			return fmt.Errorf("failed to execute notification: %w", err)
 		}
 	}
 
-	return tx.Commit()
+	return tx.Commit(s.ctx)
 }
 
 func (s *Scheduler) startJobProcessing() {
@@ -701,37 +718,64 @@ func (s *Scheduler) acquireAndRunJobs(quota int) error {
 	if len(jobNames) == 0 {
 		return nil
 	}
-	tx, err := s.db.Beginx()
+	tx, err := s.db.Begin(s.ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(s.ctx)
+
+	/*
+			query := fmt.Sprintf(`
+		        WITH available_jobs AS (
+		            SELECT name, key, parameters, retries
+		            FROM %s
+		            WHERE name IN (?)
+		            AND picked = false
+		            AND next_run <= ?
+		            AND status = ?
+		            ORDER BY next_run
+		            LIMIT ?
+		            FOR UPDATE SKIP LOCKED
+		        )
+		        UPDATE %s j
+		        SET
+		            picked = true,
+		            picked_by = ?,
+		            heartbeat = ?,
+		            status = ?
+		        FROM available_jobs
+		        WHERE j.name = available_jobs.name
+		        AND j.key = available_jobs.key
+		        RETURNING j.name, j.key, j.parameters, j.retries`,
+				s.tableName, s.tableName)
+
+	*/
 
 	query := fmt.Sprintf(`
         WITH available_jobs AS (
             SELECT name, key, parameters, retries
             FROM %s
-            WHERE name IN (?)
+            WHERE name = ANY ($1)
             AND picked = false 
-            AND next_run <= ?
-            AND status = ?
+            AND next_run <= $2
+            AND status = $3
             ORDER BY next_run 
-            LIMIT ?
+            LIMIT $4
             FOR UPDATE SKIP LOCKED
         )
         UPDATE %s j
         SET 
             picked = true,
-            picked_by = ?,
-            heartbeat = ?,
-            status = ?
+            picked_by = $5,
+            heartbeat = $6,
+            status = $7
         FROM available_jobs
         WHERE j.name = available_jobs.name
         AND j.key = available_jobs.key
         RETURNING j.name, j.key, j.parameters, j.retries`,
 		s.tableName, s.tableName)
 
-	query, args, err := sqlx.In(query, jobNames,
+	rows, err := tx.Query(s.ctx, query, jobNames,
 		s.clock.Now().UTC(),
 		StatusPending,
 		quota,
@@ -741,12 +785,14 @@ func (s *Scheduler) acquireAndRunJobs(quota int) error {
 	if err != nil {
 		return fmt.Errorf("failed to expand IN clause: %w", err)
 	}
-	query = tx.Rebind(query)
+	/*	query = tx.Rebind(query)
 
-	rows, err := tx.Query(query, args...)
+		rows, err := tx.Query(query, args...)
+	*/
 	if err != nil {
 		return fmt.Errorf("failed to acquire jobs: %w", err)
 	}
+
 	defer rows.Close()
 
 	jobsToRun := make([]struct {
@@ -769,7 +815,7 @@ func (s *Scheduler) acquireAndRunJobs(quota int) error {
 		jobsToRun = append(jobsToRun, job)
 	}
 
-	if err = tx.Commit(); err != nil {
+	if err = tx.Commit(s.ctx); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
@@ -788,7 +834,7 @@ func (s *Scheduler) acquireAndRunJobs(quota int) error {
 			return fmt.Errorf("failed to prepare status change notification: %w", err)
 		}
 		if notifyQuery != nil {
-			_, err = s.db.ExecContext(s.ctx, notifyQuery.Query, notifyQuery.Params...)
+			_, err = s.db.Exec(s.ctx, notifyQuery.Query, notifyQuery.Params...)
 			if err != nil {
 				return fmt.Errorf("failed to execute notification: %w", err)
 			}
@@ -858,12 +904,12 @@ func (s *Scheduler) runJob(name string, key string, job Job, parameters json.Raw
 }
 
 func (s *Scheduler) markJobFailed(name, key string, job Job, executionTime time.Duration) {
-	tx, err := s.db.BeginTx(s.ctx, nil)
+	tx, err := s.db.Begin(s.ctx)
 	if err != nil {
 		s.config.Logger.Error("failed to begin transaction", "error", err)
 		return
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(s.ctx)
 
 	parameters, err := json.Marshal(job.Parameters())
 	if err != nil {
@@ -877,7 +923,7 @@ func (s *Scheduler) markJobFailed(name, key string, job Job, executionTime time.
         SELECT retries 
         FROM %s 
         WHERE name = $1 AND key = $2`, s.tableName)
-	err = tx.QueryRow(query, name, key).Scan(&currentRetries)
+	err = tx.QueryRow(s.ctx, query, name, key).Scan(&currentRetries)
 	if err != nil {
 		s.config.Logger.Error("failed to get current retries", "job", name, "key", key, "error", err)
 		return
@@ -922,7 +968,7 @@ func (s *Scheduler) markJobFailed(name, key string, job Job, executionTime time.
             retries = $7
         WHERE name = $8 AND key = $9`, s.tableName)
 
-	_, err = tx.Exec(query,
+	_, err = tx.Exec(s.ctx, query,
 		uuid.Nil,
 		nextRun,
 		status,
@@ -946,25 +992,25 @@ func (s *Scheduler) markJobFailed(name, key string, job Job, executionTime time.
 	}
 
 	if notifyQuery != nil {
-		_, err = tx.ExecContext(s.ctx, notifyQuery.Query, notifyQuery.Params...)
+		_, err = tx.Exec(s.ctx, notifyQuery.Query, notifyQuery.Params...)
 		if err != nil {
 			s.config.Logger.Error("failed to execute notification", "error", err)
 			return
 		}
 	}
 
-	if err = tx.Commit(); err != nil {
+	if err = tx.Commit(s.ctx); err != nil {
 		s.config.Logger.Error("failed to commit transaction", "error", err)
 	}
 }
 
 func (s *Scheduler) markJobSucceeded(name, key string, job Job, executionTime time.Duration) {
-	tx, err := s.db.BeginTx(s.ctx, nil)
+	tx, err := s.db.Begin(s.ctx)
 	if err != nil {
 		s.config.Logger.Error("failed to begin transaction", "error", err)
 		return
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(s.ctx)
 
 	parameters, err := json.Marshal(job.Parameters())
 	if err != nil {
@@ -1002,7 +1048,7 @@ func (s *Scheduler) markJobSucceeded(name, key string, job Job, executionTime ti
             retries = $8
         WHERE name = $9 AND key = $10`, s.tableName)
 
-	_, err = tx.Exec(query,
+	_, err = tx.Exec(s.ctx, query,
 		newStatus,
 		nowUTC,
 		uuid.Nil,
@@ -1027,24 +1073,24 @@ func (s *Scheduler) markJobSucceeded(name, key string, job Job, executionTime ti
 	}
 
 	if notifyQuery != nil {
-		_, err = tx.ExecContext(s.ctx, notifyQuery.Query, notifyQuery.Params...)
+		_, err = tx.Exec(s.ctx, notifyQuery.Query, notifyQuery.Params...)
 		if err != nil {
 			s.config.Logger.Error("failed to execute notification", "error", err)
 			return
 		}
 	}
 
-	if err = tx.Commit(); err != nil {
+	if err = tx.Commit(s.ctx); err != nil {
 		s.config.Logger.Error("failed to commit transaction", "error", err)
 	}
 }
 func (s *Scheduler) markJobCancelled(name, key string) {
-	tx, err := s.db.BeginTx(s.ctx, nil)
+	tx, err := s.db.Begin(s.ctx)
 	if err != nil {
 		s.config.Logger.Error("failed to begin transaction", "error", err)
 		return
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(s.ctx)
 
 	nowUTC := s.clock.Now().UTC()
 	query := fmt.Sprintf(`
@@ -1057,7 +1103,7 @@ func (s *Scheduler) markJobCancelled(name, key string) {
             cancel_requested = false
         WHERE name = $4 AND key = $5`, s.tableName)
 
-	_, err = tx.Exec(query,
+	_, err = tx.Exec(s.ctx, query,
 		StatusFailed,
 		nowUTC,
 		uuid.Nil,
@@ -1077,29 +1123,29 @@ func (s *Scheduler) markJobCancelled(name, key string) {
 	}
 
 	if notifyQuery != nil {
-		_, err = tx.ExecContext(s.ctx, notifyQuery.Query, notifyQuery.Params...)
+		_, err = tx.Exec(s.ctx, notifyQuery.Query, notifyQuery.Params...)
 		if err != nil {
 			s.config.Logger.Error("failed to execute notification", "error", err)
 			return
 		}
 	}
 
-	if err = tx.Commit(); err != nil {
+	if err = tx.Commit(s.ctx); err != nil {
 		s.config.Logger.Error("failed to commit transaction", "error", err)
 	}
 }
 
 func (s *Scheduler) CancelJob(name, key string) error {
-	tx, err := s.db.BeginTx(s.ctx, nil)
+	tx, err := s.db.Begin(s.ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(s.ctx)
 
 	// First check if the job exists
 	var exists bool
 	existsQuery := fmt.Sprintf(`SELECT EXISTS(SELECT 1 FROM %s WHERE name = $1 AND key = $2)`, s.tableName)
-	err = tx.QueryRow(existsQuery, name, key).Scan(&exists)
+	err = tx.QueryRow(s.ctx, existsQuery, name, key).Scan(&exists)
 	if err != nil {
 		return fmt.Errorf("failed to check job existence: %w", err)
 	}
@@ -1115,7 +1161,7 @@ func (s *Scheduler) CancelJob(name, key string) error {
         RETURNING name`, s.tableName)
 
 	var returnedName string
-	err = tx.QueryRow(query, name, key).Scan(&returnedName)
+	err = tx.QueryRow(s.ctx, query, name, key).Scan(&returnedName)
 	if err == sql.ErrNoRows {
 		return ErrJobNotRunning
 	}
@@ -1136,13 +1182,13 @@ func (s *Scheduler) CancelJob(name, key string) error {
 
 	if s.config.PGLNInstance != nil {
 		notifyQuery := s.config.PGLNInstance.NotifyQuery(s.notificationChan, string(payload))
-		_, err = tx.ExecContext(s.ctx, notifyQuery.Query, notifyQuery.Params...)
+		_, err = tx.Exec(s.ctx, notifyQuery.Query, notifyQuery.Params...)
 		if err != nil {
 			return fmt.Errorf("failed to execute notification: %w", err)
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(s.ctx); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
@@ -1178,15 +1224,28 @@ func (s *Scheduler) checkForCancellations() {
         AND cancel_requested = true
         AND picked_by = $2`, s.tableName)
 
-	var jobs []struct {
+	/*
+		var jobs []struct {
+			Name string
+			Key  string
+		}
+	*/
+
+	type Job struct {
 		Name string
 		Key  string
 	}
-	err := s.db.Select(&jobs, query, StatusRunning, s.nodeID)
+	rows, err := s.db.Query(s.ctx, query, StatusRunning, s.nodeID)
+
+	//err := s.db.Select(s.ctx, &jobs, query, StatusRunning, s.nodeID)
+
 	if err != nil {
 		s.config.Logger.Error("failed to check for cancelled jobs", "error", err)
 		return
 	}
+	defer rows.Close()
+
+	jobs, err := pgx.CollectRows(rows, pgx.RowToStructByName[Job])
 
 	for _, job := range jobs {
 		cancelKey := getCancelKey(job.Name, job.Key)
@@ -1210,7 +1269,7 @@ func (s *Scheduler) updateHeartbeat(name, key string, stop chan struct{}) {
 	for {
 		select {
 		case <-ticker.Chan():
-			_, err := s.db.Exec(query,
+			_, err := s.db.Exec(s.ctx, query,
 				s.clock.Now().UTC(),
 				name,
 				key,
@@ -1265,7 +1324,7 @@ func (s *Scheduler) checkAndResetTimedOutJobs() error {
         SELECT name, key, prev_status FROM timed_out_jobs`,
 		s.tableName)
 
-	rows, err := s.db.Query(query,
+	rows, err := s.db.Query(s.ctx, query,
 		uuid.Nil,
 		s.clock.Now().UTC(),
 		StatusPending,
@@ -1293,7 +1352,7 @@ func (s *Scheduler) checkAndResetTimedOutJobs() error {
 		}
 
 		if notifyQuery != nil {
-			_, err = s.db.ExecContext(s.ctx, notifyQuery.Query, notifyQuery.Params...)
+			_, err = s.db.Exec(s.ctx, notifyQuery.Query, notifyQuery.Params...)
 			if err != nil {
 				return fmt.Errorf("failed to execute notification: %w", err)
 			}
@@ -1329,7 +1388,7 @@ func (s *Scheduler) cleanFailedAndCompletedJobs() error {
         AND last_run < $3`,
 		s.tableName)
 
-	_, err := s.db.Exec(query,
+	_, err := s.db.Exec(s.ctx, query,
 		StatusFailed,
 		StatusCompleted,
 		s.clock.Now().UTC().Add(-s.config.FailedAndCompletedJobCleanupInterval))
@@ -1369,23 +1428,34 @@ func (s *Scheduler) cleanOrphanedJobs() error {
 		return nil
 	}
 
+	/*
+			query := fmt.Sprintf(`
+		            DELETE FROM %s
+		            WHERE name NOT IN (?)
+		        AND heartbeat < ?`, s.tableName)
+	*/
 	query := fmt.Sprintf(`
             DELETE FROM %s
-            WHERE name NOT IN (?)
-        AND heartbeat < ?`, s.tableName)
+            WHERE name != ANY ($1)
+        AND heartbeat < $2`, s.tableName)
 
-	query, args, err := sqlx.In(query, jobNames, s.clock.Now().UTC().Add(-s.config.OrphanedJobTimeout))
+	result, err := s.db.Exec(s.ctx, query, jobNames, s.clock.Now().UTC().Add(-s.config.OrphanedJobTimeout))
+
+	//	query, args, err := sqlx.In(query, jobNames, s.clock.Now().UTC().Add(-s.config.OrphanedJobTimeout))
+
 	if err != nil {
 		return fmt.Errorf("failed to expand IN clause: %w", err)
 	}
 
-	query = s.db.Rebind(query)
-	result, err := s.db.Exec(query, args...)
-	if err != nil {
-		return fmt.Errorf("failed to clean orphaned jobs: %w", err)
-	}
+	/*
+		query = s.db.Rebind(query)
+		result, err := s.db.Exec(query, args...)
+		if err != nil {
+			return fmt.Errorf("failed to clean orphaned jobs: %w", err)
+		}
+	*/
 
-	if rowsAffected, err := result.RowsAffected(); err == nil && rowsAffected > 0 {
+	if rowsAffected := result.RowsAffected(); rowsAffected > 0 {
 		s.config.Logger.Info("cleaned orphaned jobs", "count", rowsAffected)
 	}
 

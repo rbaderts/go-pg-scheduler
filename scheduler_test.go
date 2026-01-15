@@ -2,27 +2,31 @@ package pgscheduler
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
-	"github.com/google/uuid"
-	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"log/slog"
 	"os"
 	"testing"
 	"time"
 
-	"github.com/jmoiron/sqlx"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	//	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/jonboulle/clockwork"
 	_ "github.com/lib/pq"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-var testDB *sqlx.DB
-var testDBSQL *sql.DB
+// var testDB *sqlx.DB
+// var testDBSQL *sql.DB
 var dsn string
+
+var pool *pgxpool.Pool
 
 func TestMain(m *testing.M) {
 	ctx := context.Background()
@@ -58,13 +62,20 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	dsn = fmt.Sprintf("host=%s port=%s user=testuser password=testpass dbname=testdb sslmode=disable", host, port.Port())
+	//dsn = fmt.Sprintf("host=%s port=%s user=testuser password=testpass dbname=testdb sslmode=disable", host, port.Port())
+	//`:w
+	// jjj`	dsn = fmt.Sprintf("host=%s port=%s user=testuser password=testpass dbname=testdb sslmode=disable", host, port.Port())
+	dsn = fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", "testuser", "testpass", host, port.Port(), "testdb")
 
 	// Try to connect multiple times
 	for i := 0; i < 5; i++ {
-		testDBSQL, err = sql.Open("pgx", dsn)
+		//testDBSQL, err = sql.Open("pgx", dsn)
+		//POSTGRES_URL=postgres://brackets:password@localhost:5432/brackets?sslmode=disable
+
+		pool, err = pgxpool.New(ctx, dsn)
+
 		if err == nil {
-			err = testDBSQL.Ping()
+			err = pool.Ping(ctx)
 			if err == nil {
 				break
 			}
@@ -77,13 +88,13 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	if testDBSQL == nil {
+	if pool == nil {
 		fmt.Println("Failed to connect to database")
 		os.Exit(1)
 	}
 
 	fmt.Println("Successfully connected to database")
-	defer testDBSQL.Close()
+	defer pool.Close()
 
 	code := m.Run()
 	os.Exit(code)
@@ -164,9 +175,10 @@ func setupTestScheduler(t *testing.T, schema string) (*Scheduler, clockwork.Fake
 	testLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	fakeClock := clockwork.NewFakeClock()
+
 	ctx := context.WithValue(context.Background(), "clockwork", fakeClock)
 	config := SchedulerConfig{
-		DB:                                   testDBSQL,
+		DB:                                   pool,
 		DBDriverName:                         "postgres",
 		MaxRunningJobs:                       10,
 		JobCheckInterval:                     time.Second,
@@ -188,7 +200,7 @@ func setupTestScheduler(t *testing.T, schema string) (*Scheduler, clockwork.Fake
 	scheduler, err := NewScheduler(config)
 	require.NoError(t, err)
 	require.NotNil(t, scheduler)
-	testDB = scheduler.db
+	//testDB = scheduler.db
 
 	err = scheduler.Init()
 	require.NoError(t, err)
@@ -202,12 +214,12 @@ func setupTestScheduler(t *testing.T, schema string) (*Scheduler, clockwork.Fake
 func cleanupTestDatabase(t *testing.T, scheduler *Scheduler) {
 	scheduler.Shutdown()
 	query := fmt.Sprintf(`DROP TABLE IF EXISTS "%s"."%s"`, scheduler.config.Schema, scheduler.config.TablePrefix+scheduledJobsTableName)
-	_, err := testDB.Exec(query)
+	_, err := pool.Exec(context.Background(), query)
 	require.NoError(t, err)
 
 	if scheduler.config.Schema != "public" {
 		query = fmt.Sprintf(`DROP SCHEMA IF EXISTS "%s" CASCADE`, scheduler.config.Schema)
-		_, err = testDB.Exec(query)
+		_, err = pool.Exec(context.Background(), query)
 		require.NoError(t, err)
 	}
 }
@@ -227,7 +239,8 @@ func TestNewSchedulerWithCustomSchema(t *testing.T) {
 
 	var schemaExists bool
 	query := `SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)`
-	err := testDB.Get(&schemaExists, query, "custom_schema")
+	//err := pool.Get(&schemaExists, query, "custom_schema")
+	err := pool.QueryRow(context.Background(), query, "custom_schema").Scan(&schemaExists)
 	require.NoError(t, err)
 	assert.True(t, schemaExists, "Custom schema should exist")
 }
@@ -238,6 +251,8 @@ func TestRegisterAndScheduleJob(t *testing.T) {
 
 	job, err := NewTestRecurringJobWithKey("test_job", "key1", "* * * * *")
 	require.NoError(t, err)
+
+	scheduler.ctx = context.Background()
 
 	// Try scheduling without registration first
 	err = scheduler.ScheduleJob(job)
@@ -253,10 +268,21 @@ func TestRegisterAndScheduleJob(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify job was added to the database
-	var record JobRecord
+	//	var record JobRecord
 	query := fmt.Sprintf(`SELECT * FROM %s WHERE name = $1 AND key = $2`, scheduler.tableName)
-	err = testDB.Get(&record, query, job.Name(), job.Key())
+	//	err = testDB.Get(&record, query, job.Name(), job.Key())
+	rows, err := pool.Query(context.Background(), query, job.Name(), job.Key())
+	if err != nil {
+		fmt.Printf("Err = %v\n", err)
+	}
 	assert.NoError(t, err)
+	defer rows.Close()
+
+	recs, err := pgx.CollectRows(rows, pgx.RowToStructByName[JobRecord])
+
+	assert.NoError(t, err)
+	record := recs[0]
+
 	assert.Equal(t, job.Name(), record.Name)
 	assert.Equal(t, job.Key(), record.Key)
 	assert.Equal(t, epochStart, record.Heartbeat.Time.UTC())
@@ -273,6 +299,7 @@ func TestScheduleDifferentJobKeys(t *testing.T) {
 	job2, err := NewTestRecurringJobWithKey("test_job", "key2", "* * * * *")
 	require.NoError(t, err)
 
+	scheduler.ctx = context.Background()
 	// Register the job
 	err = scheduler.RegisterJob(job1)
 	assert.NoError(t, err)
@@ -287,7 +314,8 @@ func TestScheduleDifferentJobKeys(t *testing.T) {
 	// Verify both jobs were added to the database
 	var count int
 	query := fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE name = $1`, scheduler.tableName)
-	err = testDB.Get(&count, query, job1.Name())
+	//err = testDB.Get(&count, query, job1.Name())
+	err = pool.QueryRow(context.Background(), query, job1.Name()).Scan(&count)
 	assert.NoError(t, err)
 	assert.Equal(t, 2, count, "Should have two jobs with different keys")
 }
@@ -299,6 +327,7 @@ func TestRegisterDuplicateJob(t *testing.T) {
 	job, err := NewTestRecurringJobWithKey("test_job", "key1", "* * * * *")
 	require.NoError(t, err)
 
+	scheduler.ctx = context.Background()
 	// Register the job first time
 	err = scheduler.RegisterJob(job)
 	assert.NoError(t, err)
@@ -329,8 +358,19 @@ func TestJobExecution(t *testing.T) {
 	// Verify job execution
 	var record JobRecord
 	query := fmt.Sprintf(`SELECT * FROM %s WHERE name = $1 AND key = $2`, scheduler.tableName)
-	err = testDB.Get(&record, query, job.Name(), job.Key())
-	require.NoError(t, err)
+
+	//err = testDB.Get(&record, query, job.Name(), job.Key())
+	//	err = testDB.Get(&record, query, job.Name(), job.Key())
+
+	rows, err := pool.Query(context.Background(), query, job.Name(), job.Key())
+
+	assert.NoError(t, err)
+	if err != nil {
+		fmt.Printf("Err = %v\n", err)
+	}
+	defer rows.Close()
+	recs, err := pgx.CollectRows(rows, pgx.RowToStructByName[JobRecord])
+	record = recs[0]
 
 	assert.False(t, record.Picked)
 	assert.True(t, record.LastSuccess.Valid)
@@ -354,6 +394,7 @@ func TestRetryLogic(t *testing.T) {
 		},
 	}
 
+	scheduler.ctx = context.Background()
 	// Register and schedule the job
 	err := scheduler.RegisterJob(failingJob)
 	require.NoError(t, err)
@@ -371,7 +412,13 @@ func TestRetryLogic(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	var finalState bool
 	for time.Now().Before(deadline) {
-		err = testDB.Get(&record, query, failingJob.Name(), failingJob.Key())
+		//err = testDB.Get(&record, query, failingJob.Name(), failingJob.Key())
+		rows, err := pool.Query(context.Background(), query, failingJob.Name(), failingJob.Key())
+		require.NoError(t, err)
+		defer rows.Close()
+
+		recs, err := pgx.CollectRows(rows, pgx.RowToStructByName[JobRecord])
+		record := recs[0]
 		require.NoError(t, err)
 
 		if record.Status == StatusFailed && record.Retries == 0 {
@@ -410,6 +457,7 @@ func TestJobCancellation(t *testing.T) {
 		},
 	}
 
+	scheduler.ctx = context.Background()
 	// Register and schedule the job
 	err := scheduler.RegisterJob(longRunningJob)
 	require.NoError(t, err)
@@ -426,10 +474,16 @@ func TestJobCancellation(t *testing.T) {
 		fakeClock.Advance(time.Minute)
 		time.Sleep(2 * time.Second)
 		// Verify job is running
-		err = testDB.Get(&record, query, longRunningJob.Name(), longRunningJob.Key())
+		///err = testDB.Get(&record, query, longRunningJob.Name(), longRunningJob.Key())
+		rows, err := pool.Query(context.Background(), query, longRunningJob.Name(), longRunningJob.Key())
 		if err == nil && record.Status == StatusRunning {
 			break
 		}
+		defer rows.Close()
+		recs, err := pgx.CollectRows(rows, pgx.RowToStructByName[JobRecord])
+		require.NoError(t, err)
+		record = recs[0]
+
 	}
 	require.NoError(t, err)
 	assert.Equal(t, StatusRunning, record.Status)
@@ -446,8 +500,15 @@ func TestJobCancellation(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Verify job was cancelled
-	err = testDB.Get(&record, query, longRunningJob.Name(), longRunningJob.Key())
+	//`jrr = testDB.Get(&record, query, longRunningJob.Name(), longRunningJob.Key())
+	rows, err := pool.Query(context.Background(), query, longRunningJob.Name(), longRunningJob.Key())
 	require.NoError(t, err)
+	defer rows.Close()
+
+	recs, err := pgx.CollectRows(rows, pgx.RowToStructByName[JobRecord])
+	require.NoError(t, err)
+	record = recs[0]
+
 	assert.Equal(t, StatusFailed, record.Status)
 	assert.False(t, record.Picked)
 	assert.True(t, record.NextRun == nil)
@@ -485,7 +546,9 @@ func TestConcurrentJobProcessing(t *testing.T) {
         WHERE last_success IS NOT NULL`, scheduler.tableName)
 
 	var completedCount int
-	err := testDB.Get(&completedCount, query)
+	//	err := testDB.Get(&completedCount, query)
+	err := pool.QueryRow(context.Background(), query).Scan(&completedCount)
+
 	require.NoError(t, err)
 	assert.Equal(t, jobCount, completedCount)
 
@@ -497,6 +560,7 @@ func TestCancelNonExistentJob(t *testing.T) {
 	scheduler, _ := setupTestScheduler(t, "public")
 	defer cleanupTestDatabase(t, scheduler)
 
+	scheduler.ctx = context.Background()
 	err := scheduler.CancelJob("non_existent", "key1")
 	assert.Error(t, err)
 	assert.Equal(t, ErrJobNotFound, err)
@@ -522,6 +586,7 @@ func TestCancelRunningJobFromDifferentNode(t *testing.T) {
 	}
 
 	// Register and schedule the job
+	scheduler.ctx = context.Background()
 	err := scheduler.RegisterJob(longRunningJob)
 	require.NoError(t, err)
 	err = scheduler.ScheduleJob(longRunningJob)
@@ -537,6 +602,7 @@ func TestCancelRunningJobFromDifferentNode(t *testing.T) {
 	fakeClock.Advance(time.Minute)
 	time.Sleep(2 * time.Second)
 
+	ctx := context.Background()
 	// Manually update the job to appear as if running on a different node
 	differentNodeID := uuid.New()
 	query := fmt.Sprintf(`
@@ -544,8 +610,10 @@ func TestCancelRunningJobFromDifferentNode(t *testing.T) {
         SET picked_by = $1 
         WHERE name = $2 AND key = $3`,
 		scheduler.tableName)
-	_, err = testDB.Exec(query, differentNodeID, longRunningJob.Name(), longRunningJob.Key())
+	_, err = pool.Exec(ctx, query, differentNodeID, longRunningJob.Name(), longRunningJob.Key())
 	require.NoError(t, err)
+
+	scheduler.ctx = ctx
 
 	// Try to cancel the job
 	for i := 0; i < 10; i++ {
@@ -563,11 +631,21 @@ func TestCancelRunningJobFromDifferentNode(t *testing.T) {
 	fakeClock.Advance(time.Minute)
 	time.Sleep(2 * time.Second)
 
+	ctx = context.Background()
 	// Verify cancel_requested was done
 	var record JobRecord
 	query = fmt.Sprintf(`SELECT * FROM %s WHERE name = $1 AND key = $2`, scheduler.tableName)
-	err = testDB.Get(&record, query, longRunningJob.Name(), longRunningJob.Key())
+	//err = testDB.Get(&record, query, longRunningJob.Name(), longRunningJob.Key())
+	rows, err := pool.Query(ctx, query, longRunningJob.Name(), longRunningJob.Key())
 	require.NoError(t, err)
+	if err != nil {
+		fmt.Printf("Err = %v\n", err)
+	}
+	defer rows.Close()
+
+	recs, err := pgx.CollectRows(rows, pgx.RowToStructByName[JobRecord])
+	record = recs[0]
+
 	assert.Equal(t, StatusFailed, record.Status)
 	assert.False(t, record.CancelRequested)
 	assert.False(t, record.Picked)
@@ -587,7 +665,8 @@ func TestHeartbeatMonitoring(t *testing.T) {
 
 	query := fmt.Sprintf(`SELECT heartbeat FROM %s WHERE name = $1 AND key = $2`, scheduler.tableName)
 	var heartbeat time.Time
-	err = testDB.Get(&heartbeat, query, job.Name(), job.Key())
+	//err = testDB.Get(&heartbeat, query, job.Name(), job.Key())
+	err = pool.QueryRow(context.Background(), query, job.Name(), job.Key()).Scan(&heartbeat)
 	require.NoError(t, err)
 	assert.Equal(t, epochStart, heartbeat.UTC())
 
@@ -595,7 +674,8 @@ func TestHeartbeatMonitoring(t *testing.T) {
 	fakeClock.Advance(time.Minute)
 	time.Sleep(2 * time.Second) // Allow job to start and update heartbeat
 
-	err = testDB.Get(&heartbeat, query, job.Name(), job.Key())
+	//err = testDB.Get(&heartbeat, query, job.Name(), job.Key())
+	err = pool.QueryRow(context.Background(), query, job.Name(), job.Key()).Scan(&heartbeat)
 	require.NoError(t, err)
 	assert.True(t, heartbeat.After(epochStart))
 }
@@ -607,6 +687,7 @@ func TestHeartbeatTimeout(t *testing.T) {
 	job, err := NewTestRecurringJobWithKey("test_job", "key1", "* * * * *")
 	require.NoError(t, err)
 
+	scheduler.ctx = context.Background()
 	err = scheduler.RegisterJob(job)
 	require.NoError(t, err)
 	err = scheduler.ScheduleJob(job)
@@ -622,7 +703,7 @@ func TestHeartbeatTimeout(t *testing.T) {
         WHERE name = $4 AND key = $5`,
 		scheduler.tableName)
 
-	_, err = testDB.Exec(query,
+	_, err = pool.Exec(scheduler.ctx, query,
 		scheduler.nodeID,
 		StatusRunning,
 		fakeClock.Now().UTC(),
@@ -637,7 +718,16 @@ func TestHeartbeatTimeout(t *testing.T) {
 	// Verify job was reset
 	var record JobRecord
 	query = fmt.Sprintf(`SELECT * FROM %s WHERE name = $1 AND key = $2`, scheduler.tableName)
-	err = testDB.Get(&record, query, job.Name(), job.Key())
+	//`jlerr = testDB.Get(&record, query, job.Name(), job.Key())
+	//err = pool.QueryRow(context.Background(), job.Name(), job.Key()).Scan(&record)
+	rows, err := pool.Query(context.Background(), query, job.Name(), job.Key())
+	assert.NoError(t, err)
+	if err != nil {
+		fmt.Printf("Err = %v\n", err)
+	}
+	defer rows.Close()
+	recs, err := pgx.CollectRows(rows, pgx.RowToStructByName[JobRecord])
+	record = recs[0]
 	require.NoError(t, err)
 
 	assert.False(t, record.Picked)
@@ -652,6 +742,7 @@ func TestFailedAndCompletedJobCleanup(t *testing.T) {
 	job, err := NewTestOneTimeJob("cleanup_job", "key1", nil, 0)
 	require.NoError(t, err)
 
+	scheduler.ctx = context.Background()
 	err = scheduler.RegisterJob(job)
 	require.NoError(t, err)
 	err = scheduler.ScheduleJob(job)
@@ -669,7 +760,7 @@ func TestFailedAndCompletedJobCleanup(t *testing.T) {
         WHERE name = $3 AND key = $4`,
 		scheduler.tableName)
 
-	_, err = testDB.Exec(query,
+	_, err = pool.Exec(context.Background(), query,
 		StatusFailed,
 		fakeClock.Now().UTC(),
 		job.Name(),
@@ -682,7 +773,8 @@ func TestFailedAndCompletedJobCleanup(t *testing.T) {
 	// Verify job was cleaned up
 	var count int
 	query = fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE name = $1 AND key = $2`, scheduler.tableName)
-	err = testDB.Get(&count, query, job.Name(), job.Key())
+	err = pool.QueryRow(context.Background(), job.Name(), job.Key()).Scan(&count)
+	//	err = testDB.Get(&count, query, job.Name(), job.Key())
 	require.NoError(t, err)
 	assert.Equal(t, 0, count)
 }
@@ -697,7 +789,7 @@ func TestOrphanedJobCleanup(t *testing.T) {
         VALUES ($1, $2, $3, false, $4, $5)`,
 		scheduler.tableName)
 
-	_, err := testDB.Exec(query,
+	_, err := pool.Exec(context.Background(), query,
 		"orphaned_job",
 		"orphaned_key",
 		epochStart,
@@ -721,11 +813,13 @@ func TestOrphanedJobCleanup(t *testing.T) {
 	var count int
 	query = fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE name = $1`, scheduler.tableName)
 
-	err = testDB.Get(&count, query, "orphaned_job")
+	//	err = testDB.Get(&count, query, "orphaned_job")
+	err = pool.QueryRow(context.Background(), query, "orphaned_job").Scan(&count)
 	require.NoError(t, err)
 	assert.Equal(t, 0, count, "Orphaned job should be cleaned up")
 
-	err = testDB.Get(&count, query, "valid_job")
+	//	err = testDB.Get(&count, query, "valid_job")
+	err = pool.QueryRow(context.Background(), query, "valid").Scan(&count)
 	require.NoError(t, err)
 	assert.Equal(t, 1, count, "Valid job should remain")
 }
@@ -733,6 +827,7 @@ func TestOrphanedJobCleanup(t *testing.T) {
 func TestSchedulerShutdown(t *testing.T) {
 	scheduler, fakeClock := setupTestScheduler(t, "public")
 
+	scheduler.ctx = context.Background()
 	// Create and register multiple jobs
 	for i := 0; i < 3; i++ {
 		job, err := NewTestRecurringJobWithKey(
@@ -799,6 +894,7 @@ func TestSchedulerMaxRunningJobs(t *testing.T) {
 		require.NoError(t, err)
 	}
 
+	scheduler.ctx = context.Background()
 	// Trigger job execution
 	fakeClock.Advance(time.Minute)
 	time.Sleep(1 * time.Second) // Allow initial jobs to start
@@ -824,7 +920,8 @@ func TestSchedulerMaxRunningJobs(t *testing.T) {
         WHERE last_success IS NOT NULL`,
 		scheduler.tableName)
 
-	err := testDB.Get(&completedCount, query)
+	//	err := testDB.Get(&completedCount, query)
+	err := pool.QueryRow(context.Background(), query).Scan(&completedCount)
 	require.NoError(t, err)
 	assert.Equal(t, 4, completedCount)
 }

@@ -1,11 +1,10 @@
-module github.com/tzahifadida/go-pg-scheduler
+module github.com/rbaderts/go-pg-scheduler
 
 go 1.23
 
 require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.6.0
-	github.com/jmoiron/sqlx v1.4.0
 	github.com/jonboulle/clockwork v0.4.0
 	github.com/lib/pq v1.10.9
 	github.com/robfig/cron/v3 v3.0.1
